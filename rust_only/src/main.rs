@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-use pdf_oxide::PdfDocument;
+use rayon::prelude::*;
 use reqwest::Client;
 use text_splitter::TextSplitter;
 
@@ -23,11 +23,11 @@ async fn main() {
     // ── Load .env (mirrors Python's load_dotenv()) ─────────────────────────────
     dotenvy::dotenv().ok();
 
-    let api_key = std::env::var("API_KEY").expect("API_KEY not set in .env");
+    let api_key    = std::env::var("API_KEY").expect("API_KEY not set in .env");
     let model_name = std::env::var("MODEL").expect("MODEL not set in .env");
     let pdf_folder = std::env::var("PDF_FOLDER").unwrap_or_else(|_| "./pdfs".to_string());
 
-    // ── Collect all PDF paths from the folder (mirrors Python) ─────────────────
+    // ── Collect all PDF paths from the folder ──────────────────────────────────
     let pdf_files: Vec<std::path::PathBuf> = std::fs::read_dir(&pdf_folder)
         .unwrap_or_else(|_| panic!("Cannot read PDF folder: {}", pdf_folder))
         .filter_map(|entry| {
@@ -64,7 +64,7 @@ async fn main() {
             .expect("Cannot write CSV header");
     }
 
-    // ── One-time setup: load model outside the loop (mirrors Python) ───────────
+    // ── One-time setup: load model outside the loop ────────────────────────────
     println!("Loading embedding model (once)...");
     let model = embedder::load_model();
 
@@ -75,20 +75,57 @@ async fn main() {
         println!("\n{}", "─".repeat(50));
         println!("Run {}/{}", run, NUM_RUNS);
 
-        // 1. PDF read & extract — all files in /pdfs ───────────────────────────
+        // 1. PDF read & extract ─────────────────────────────────────────────────
+        //
+        // TWO levels of Rayon parallelism:
+        //
+        //   Level 1 — par_iter() over pdf_files:
+        //     Each PDF file is opened and fully extracted on a separate Rayon
+        //     thread. With N files you get up to N threads working concurrently.
+        //
+        //   Level 2 — into_par_iter() over page indices:
+        //     Within each file, every page is extracted in parallel. Because
+        //     pdf_oxide's PdfDocument is not Sync, we open a fresh handle per
+        //     page (cheap — just a memory-mapped file descriptor). Pages are
+        //     collected into a Vec, sorted by index to preserve order, then
+        //     joined into a single String for that file.
+        //
+        //   The outer collect::<Vec<String>> preserves file order (par_iter
+        //   on a slice always returns results in input order), so file_content
+        //   is fully deterministic.
         let t = Instant::now();
 
-        let mut file_content = String::new();
-        for pdf_path in &pdf_files {
-            let mut doc = PdfDocument::open(pdf_path)
-                .unwrap_or_else(|_| panic!("Could not open PDF: {:?}", pdf_path));
-            let pages = doc.page_count().expect("Could not get page count");
-            for i in 0..pages {
-                let page_text = doc.extract_text(i).unwrap_or_default();
-                file_content.push_str(&page_text);
-                file_content.push_str("\n\n");
-            }
-        }
+        let per_file_texts: Vec<String> = pdf_files
+            .par_iter()                                      // Level 1: parallel files
+            .map(|pdf_path| {
+                // We need page_count — open once sequentially for the count only
+                let mut probe = pdf_oxide::PdfDocument::open(pdf_path)
+                    .unwrap_or_else(|_| panic!("Could not open PDF: {:?}", pdf_path));
+                let pages = probe.page_count().expect("Could not get page count");
+
+                // Level 2: parallel pages — each page gets its own file handle
+                let mut page_texts: Vec<(u32, String)> = (0..pages)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut d = pdf_oxide::PdfDocument::open(pdf_path)
+                            .expect("Could not re-open PDF for parallel page read");
+                        let text = d.extract_text(i as u32).unwrap_or_default();
+                        (i as u32, text)
+                    })
+                    .collect();
+
+                // Restore page order after parallel collection
+                page_texts.sort_unstable_by_key(|(i, _)| *i);
+
+                page_texts
+                    .into_iter()
+                    .map(|(_, text)| format!("{}\n\n", text))
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Concatenate files in their original directory order
+        let file_content: String = per_file_texts.concat();
 
         let pdf_read_ms = t.elapsed().as_secs_f64() * 1000.0;
         println!(
@@ -110,7 +147,12 @@ async fn main() {
             docs.len()
         );
 
-        // 3. Bulk embedding (model already loaded) ─────────────────────────────
+        // 3. Bulk embedding ────────────────────────────────────────────────────
+        //
+        // NOTE: fastembed's ONNX runtime already saturates all CPU cores
+        // internally via its own thread pool. Adding a Rayon wrapper here
+        // would create thread contention and hurt performance, so this call
+        // is intentionally left sequential.
         let t = Instant::now();
 
         println!("  Encoding chunks in bulk...");
@@ -119,7 +161,7 @@ async fn main() {
         let embedding_ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("  Model/Embedding Stage: {:.4} ms", embedding_ms);
 
-        // 4. DB insertion (overwrite — store handles reset internally) ──────────
+        // 4. DB insertion ──────────────────────────────────────────────────────
         let t = Instant::now();
 
         let table = store::get_table().await;
