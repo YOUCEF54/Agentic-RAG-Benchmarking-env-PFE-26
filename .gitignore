@@ -28,3 +28,6 @@ Cargo.lock
 Thumbs.db
 .vscode/
 .idea/
+
+# folders
+pdfs
