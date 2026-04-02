@@ -10,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 
 
 # ── CSV setup ──────────────────────────────────────────────────────────────────
-CSV_FILE = "profile_results.csv"
+CSV_FILE = "profile_results_py.csv"
 CSV_HEADER = "run,pdf_read_ms,chunking_ms,model_embedding_ms,db_insert_ms,search_ms\n"
 
 if not os.path.exists(CSV_FILE):
@@ -36,8 +36,9 @@ if not pdf_files:
 print(f"Found {len(pdf_files)} PDF(s): {[os.path.basename(p) for p in pdf_files]}")
 
 print("Loading embedding model (once)...")
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+embed_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 QUESTION = (
     "Question: According to the abstract, what specific type of 'framework' "
     "does this paper propose to support knowledge management and decision-making?"
@@ -99,7 +100,8 @@ for run in range(1, NUM_RUNS + 1):
     # 5. Vector search ─────────────────────────────────────────────────────────
     t0 = time.perf_counter()
 
-    query_embedding = embed_model.encode(QUESTION)
+    query_text = f"{BGE_QUERY_PREFIX}{QUESTION}"
+    query_embedding = embed_model.encode(query_text)
     results = table.search(query_embedding.tolist()).limit(2).to_list()
     context = "\n\n".join(row["text"] for row in results)
 

@@ -2,7 +2,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 pub fn load_model() -> TextEmbedding {
     TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+        InitOptions::new(EmbeddingModel::BGESmallENV15)
     ).unwrap()
 }
 

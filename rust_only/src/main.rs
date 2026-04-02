@@ -12,11 +12,12 @@ use reqwest::Client;
 use text_splitter::TextSplitter;
 
 const NUM_RUNS: u32 = 100;
-const CSV_FILE: &str = "profile_results.csv";
+const CSV_FILE: &str = "profile_results_rs.csv";
 const CSV_HEADER: &str = "run,pdf_read_ms,chunking_ms,model_embedding_ms,db_insert_ms,search_ms\n";
 
 const QUESTION: &str = "Question: According to the abstract, what specific type of \
     'framework' does this paper propose to support knowledge management and decision-making?";
+const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
 #[tokio::main]
 async fn main() {
@@ -104,13 +105,13 @@ async fn main() {
                 let pages = probe.page_count().expect("Could not get page count");
 
                 // Level 2: parallel pages — each page gets its own file handle
-                let mut page_texts: Vec<(u32, String)> = (0..pages)
+                let mut page_texts: Vec<(usize, String)> = (0..pages)
                     .into_par_iter()
                     .map(|i| {
                         let mut d = pdf_oxide::PdfDocument::open(pdf_path)
                             .expect("Could not re-open PDF for parallel page read");
-                        let text = d.extract_text(i as u32).unwrap_or_default();
-                        (i as u32, text)
+                        let text = d.extract_text(i).unwrap_or_default();
+                        (i, text)
                     })
                     .collect();
 
@@ -177,7 +178,8 @@ async fn main() {
         // 5. Vector search ─────────────────────────────────────────────────────
         let t = Instant::now();
 
-        let query_embedding = embedder::embed(&model, QUESTION);
+        let query_text = format!("{}{}", BGE_QUERY_PREFIX, QUESTION);
+        let query_embedding = embedder::embed(&model, &query_text);
         let chunks = store::search(&table, query_embedding, 2).await;
         context = chunks.join("\n\n");
 
